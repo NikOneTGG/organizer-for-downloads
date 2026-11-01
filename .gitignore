@@ -1,0 +1,11 @@
+**/bin/
+**/obj/
+**/TestResults/
+.vscode/settings.json
+.vscode/launch.json
+.vscode/tasks.json
+*.log
+*.tmp
+*.bak
+Thumbs.db
+Desktop.ini
