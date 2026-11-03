@@ -1,46 +1,57 @@
-
 namespace DownloadManager.Core;
 
 internal sealed record RenameSettings(
-    string Prefix,
-    bool AddDateTime,
-    bool AddRandomNumber);
+    string Nameefile,
+    bool Dateandtime,
+    bool Randomnum);
 
 internal static class Erename
 {
-    // rename settings
-    private static readonly RenameSettings Settings = new(
-    /* file rename */ "",
-    /* add date and time */ true,
-    /* add random number 1-50 */ false);
+    private static readonly string ConfigPath =
+        Path.Combine(AppContext.BaseDirectory, "config.json");
 
-    internal static bool IsEnabled =>
-        !string.IsNullOrWhiteSpace(Settings.Prefix)
-        || Settings.AddDateTime
-        || Settings.AddRandomNumber;
+    private static readonly object SettingsLock = new();
+    private static RenameSettings? _cachedSettings;
+    private static DateTime _cachedWriteTimeUtc;
 
-    internal static string GetFileName(
-        string sourcePath,
-        string destinationFolder)
+    private static RenameSettings GetSettings()
     {
-        return GetFileName(
-            sourcePath,
-            destinationFolder,
-            DateTime.Now,
-            Settings);
+        DateTime writeTime = File.Exists(ConfigPath)
+            ? File.GetLastWriteTimeUtc(ConfigPath)
+            : DateTime.MinValue;
+
+        lock (SettingsLock)
+        {
+            if (_cachedSettings is null || writeTime != _cachedWriteTimeUtc)
+            {
+                AppSettings settings = AppSettings.LoadOrCreate(ConfigPath);
+                _cachedSettings = new RenameSettings(
+                    settings.Namefile,
+                    settings.Dateandtime,
+                    settings.Randomnum);
+
+                _cachedWriteTimeUtc = File.Exists(ConfigPath)
+                    ? File.GetLastWriteTimeUtc(ConfigPath)
+                    : DateTime.MinValue;
+            }
+
+            return _cachedSettings;
+        }
     }
 
-    internal static string GetFileName(
-        string sourcePath,
-        string destinationFolder,
-        DateTime dateTime)
+    internal static bool IsEnabled
     {
-        return GetFileName(
-            sourcePath,
-            destinationFolder,
-            dateTime,
-            Settings);
+        get
+        {
+            RenameSettings settings = GetSettings();
+            return !string.IsNullOrWhiteSpace(settings.Nameefile)
+                || settings.Dateandtime
+                || settings.Randomnum;
+        }
     }
+
+    internal static string GetFileName(string sourcePath, string destinationFolder) =>
+        GetFileName(sourcePath, destinationFolder, DateTime.Now, GetSettings());
 
     internal static string GetFileName(
         string sourcePath,
@@ -50,44 +61,36 @@ internal static class Erename
     {
         string extension = Path.GetExtension(sourcePath);
         string originalName = Path.GetFileNameWithoutExtension(sourcePath);
+        string baseName = string.IsNullOrWhiteSpace(settings.Nameefile)
+            ? originalName
+            : settings.Nameefile;
 
-        List<string> parts = new();
+        if (settings.Dateandtime)
+            baseName = $"{baseName}_{dateTime:dd.MM.yyyy_HHmm}";
 
-        if (!string.IsNullOrWhiteSpace(settings.Prefix))
-            parts.Add(settings.Prefix);
+        Span<int> numbers = stackalloc int[50];
+        int count = settings.Randomnum ? numbers.Length : 1;
 
-        if (settings.AddDateTime)
-            parts.Add(dateTime.ToString("dd.MM.yyyy_HHmm"));
-
-        int[] numbers = settings.AddRandomNumber
-            ? Enumerable.Range(1, 50).ToArray()
-            : new[] { 0 };
-
-        // shuffle numbers
-        for (int i = numbers.Length - 1; i > 0; i--)
+        if (settings.Randomnum)
         {
-            int j = Random.Shared.Next(i + 1);
-            (numbers[i], numbers[j]) = (numbers[j], numbers[i]);
+            for (int i = 0; i < numbers.Length; i++)
+                numbers[i] = i + 1;
+
+            Random.Shared.Shuffle(numbers);
+        }
+        else
+        {
+            numbers[0] = 0;
         }
 
-        foreach (int number in numbers)
+        foreach (int number in numbers[..count])
         {
-            List<string> nameParts = new(parts);
-
-            if (settings.AddRandomNumber)
-                nameParts.Add(number.ToString());
-
-            string fileName = nameParts.Count > 0
-                ? string.Join("_", nameParts) + extension
-                : originalName + extension;
-
+            string suffix = settings.Randomnum ? $"_{number}" : "";
+            string fileName = baseName + suffix + extension;
             string destinationPath = Path.Combine(destinationFolder, fileName);
 
-            if (!File.Exists(destinationPath)
-                && !Directory.Exists(destinationPath))
-            {
+            if (!File.Exists(destinationPath) && !Directory.Exists(destinationPath))
                 return fileName;
-            }
         }
 
         throw new IOException(

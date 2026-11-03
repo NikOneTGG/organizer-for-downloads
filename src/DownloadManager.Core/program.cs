@@ -1,140 +1,224 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
 using System.Threading.Channels;
-namespace DownloadManager.Core
+
+namespace DownloadManager.Core;
+
+public class DownloadManager
 {
-    class DownloadManager
+    private const int QueueCapacity = 512;
+    private const int PendingWorkerCount = 8;
+
+    private static readonly Channel<string> PendingQueue =
+        Channel.CreateBounded<string>(new BoundedChannelOptions(QueueCapacity)
+        {
+            FullMode = BoundedChannelFullMode.Wait,
+            SingleReader = false,
+            SingleWriter = false
+        });
+
+    private static readonly Channel<string> FileQueue =
+        Channel.CreateBounded<string>(new BoundedChannelOptions(QueueCapacity)
+        {
+            FullMode = BoundedChannelFullMode.Wait,
+            SingleReader = true,
+            SingleWriter = false
+        });
+
+    private static readonly ConcurrentDictionary<string, byte> SeenFiles =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private static readonly ConcurrentDictionary<string, byte> IgnoredPaths =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private static readonly object PauseLock = new();
+    private static TaskCompletionSource _resumeSignal = CreateCompletedSignal();
+
+    private static TaskCompletionSource CreateCompletedSignal()
     {
-        private static readonly Channel<string> FileQueue = Channel.CreateUnbounded<string>();
-        private static readonly ConcurrentDictionary<string, byte> SeenFiles = new(StringComparer.OrdinalIgnoreCase);
-        private static readonly ConcurrentDictionary<string, byte> IgnoredPaths = new(StringComparer.OrdinalIgnoreCase);
-        static async Task Main(string[] args)
+        var signal = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        signal.SetResult();
+        return signal;
+    }
+
+    public static void SetPaused(bool paused)
+    {
+        lock (PauseLock)
         {
-            // folder to watch
-            using var check = new FileSystemWatcher(
-                Interop.KnownFolders.GetDownloadsFolderPath());
-
-            check.NotifyFilter = NotifyFilters.FileName
-                | NotifyFilters.DirectoryName;
-
-            // event
-            check.Created += OnCreated;
-            check.Renamed += OnRenamed;
-            check.Error += OnError;
-
-            check.Filter = "*.*";
-            check.IncludeSubdirectories = false;
-
-            Task processingTask = ProcessQueueAsync();
-
-            check.EnableRaisingEvents = true;
-
-            Console.WriteLine("Press enter to exit.");
-            Console.ReadLine();
-
-            check.EnableRaisingEvents = false;
-
-            FileQueue.Writer.TryComplete();
-
-            await processingTask;
-        }
-
-        // event action
-        private static void OnCreated(object sender, FileSystemEventArgs e)
-        {
-            if (Ext.FileExt.IsTemporaryFile(e.FullPath))
-                return;
-
-            if (!SeenFiles.TryAdd(e.FullPath, 0))
-                return;
-
-            _ = CheckCreatedFileAsync(e.FullPath);
-        }
-
-        // delay 4 file download finish
-        private static async Task CheckCreatedFileAsync(string path)
-        {
-            await Task.Delay(3000);
-
-            if (File.Exists(path + ".part"))
+            if (paused)
             {
-                SeenFiles.TryRemove(path, out _);
-                return;
+                if (_resumeSignal.Task.IsCompleted)
+                    _resumeSignal = new TaskCompletionSource(
+                        TaskCreationOptions.RunContinuationsAsynchronously);
             }
-
-            if (!FileQueue.Writer.TryWrite(path))
+            else
             {
-                SeenFiles.TryRemove(path, out _);
+                _resumeSignal.TrySetResult();
             }
         }
+    }
 
-        private static void OnRenamed(object sender, RenamedEventArgs e)
+    private static Task WaitUntilResumedAsync(CancellationToken token)
+    {
+        Task resumeTask;
+        lock (PauseLock)
+            resumeTask = _resumeSignal.Task;
+
+        return resumeTask.WaitAsync(token);
+    }
+
+    public static async Task RunAsync(CancellationToken cancellationToken)
+    {
+        string downloadsPath = Interop.KnownFolders.GetDownloadsFolderPath();
+
+        using var watcher = new FileSystemWatcher(downloadsPath)
         {
-            if (IgnoredPaths.TryRemove(e.FullPath, out _))
-                return;
+            NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName,
+            Filter = "*.*",
+            IncludeSubdirectories = false
+        };
 
-            QueueFile(e.FullPath);
+        watcher.Created += OnCreated;
+        watcher.Renamed += OnRenamed;
+
+        Task processingTask = ProcessQueueAsync(cancellationToken);
+        Task[] pendingWorkers = Enumerable.Range(0, PendingWorkerCount)
+            .Select(_ => ProcessPendingQueueAsync(cancellationToken))
+            .ToArray();
+
+        watcher.EnableRaisingEvents = true;
+
+        try
+        {
+            await Task.Delay(Timeout.Infinite, cancellationToken);
         }
-
-        private static void OnError(object sender, ErrorEventArgs e)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            Console.WriteLine($"Watcher error: {e.GetException().Message}");
+            // Normal shutdown.
         }
-
-        private static bool IsFileReady(string path)
+        finally
         {
+            watcher.EnableRaisingEvents = false;
+            PendingQueue.Writer.TryComplete();
+
             try
             {
-                using var stream = new FileStream(
-                    path,
-                    FileMode.Open,
-                    FileAccess.Read,
-                    FileShare.None);
-        
-                return true;
+                await Task.WhenAll(pendingWorkers);
             }
-            catch (IOException)
+            finally
             {
-                return false;
-            }
-            catch (UnauthorizedAccessException)
-            {
-                return false;
+                FileQueue.Writer.TryComplete();
+                await processingTask;
             }
         }
+    }
 
-        private static void QueueFile(string path)
+    private static void OnCreated(object sender, FileSystemEventArgs e) =>
+        ScheduleCheck(e.FullPath);
+
+    private static void OnRenamed(object sender, RenamedEventArgs e)
+    {
+        if (IgnoredPaths.TryRemove(e.FullPath, out _))
+            return;
+
+        ScheduleCheck(e.FullPath);
+    }
+
+    private static void ScheduleCheck(string path)
+    {
+        if (Ext.FileExt.IsTemporaryFile(path) || !SeenFiles.TryAdd(path, 0))
+            return;
+
+        try
         {
-            if (Ext.FileExt.IsTemporaryFile(path))
-                return;
-
-            if (!SeenFiles.TryAdd(path, 0))
-                return;
-
-            if (!FileQueue.Writer.TryWrite(path))
-            {
-                SeenFiles.TryRemove(path, out _);
-            }
+            PendingQueue.Writer.WriteAsync(path).AsTask().GetAwaiter().GetResult();
         }
-
-        private static async Task<bool> WaitForFileReady(string path)
+        catch (ChannelClosedException)
         {
-            const int maxAttempts = 10;
-            const int delayMs = 500;
-            const int requiredStableChecks = 2;
+            SeenFiles.TryRemove(path, out _);
+        }
+    }
 
-            long previousSize = -1;
-            int stableChecks = 0;
-
-            for (int attempt = 0; attempt < maxAttempts; attempt++)
+    private static async Task ProcessPendingQueueAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await foreach (string path in PendingQueue.Reader.ReadAllAsync(cancellationToken))
             {
                 try
                 {
+                    await Task.Delay(3000, cancellationToken);
+
                     if (File.Exists(path + ".part"))
                     {
-                        stableChecks = 0;
-                        await Task.Delay(delayMs);
+                        SeenFiles.TryRemove(path, out _);
                         continue;
                     }
+
+                    await FileQueue.Writer.WriteAsync(path, cancellationToken);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    SeenFiles.TryRemove(path, out _);
+                    break;
+                }
+                catch (ChannelClosedException)
+                {
+                    SeenFiles.TryRemove(path, out _);
+                }
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Normal shutdown.
+        }
+    }
+
+    private static bool IsFileReady(string path)
+    {
+        try
+        {
+            using var stream = new FileStream(
+                path, FileMode.Open, FileAccess.Read, FileShare.None);
+            return true;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    internal static async Task<bool> WaitForFileReady(
+        string path,
+        int maxAttempts = 120,
+        int delayMs = 500,
+        int requiredStableChecks = 10,
+        CancellationToken cancellationToken = default)
+    {
+        long previousSize = -1;
+        int stableChecks = 0;
+
+        for (int attempt = 0; attempt < maxAttempts; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            try
+            {
+                if (!File.Exists(path))
+                    return false;
+
+                if (File.Exists(path + ".part") ||
+                    File.Exists(path + ".crdownload"))
+                {
+                    stableChecks = 0;
+                    previousSize = -1;
+                }
+                else
+                {
                     var fileInfo = new FileInfo(path);
                     fileInfo.Refresh();
 
@@ -142,67 +226,61 @@ namespace DownloadManager.Core
                         return false;
 
                     long currentSize = fileInfo.Length;
-
-                    if (currentSize == previousSize)
-                    {
-                        stableChecks++;
-                    }
-                    else
-                    {
-                        stableChecks = 0;
-                    }
-
+                    stableChecks = currentSize == previousSize
+                        ? stableChecks + 1
+                        : 0;
                     previousSize = currentSize;
 
                     if (stableChecks >= requiredStableChecks && IsFileReady(path))
                         return true;
                 }
-                catch (IOException)
-                {
-                    stableChecks = 0;
-                }
-                catch (UnauthorizedAccessException)
-                {
-                    stableChecks = 0;
-                }
-
-                await Task.Delay(delayMs);
+            }
+            catch (IOException)
+            {
+                stableChecks = 0;
+                previousSize = -1;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                stableChecks = 0;
+                previousSize = -1;
             }
 
-            return false;
+            await Task.Delay(delayMs, cancellationToken);
         }
 
-        // async queue
-        private static async Task ProcessQueueAsync()
+        return false;
+    }
+
+    private static async Task ProcessQueueAsync(CancellationToken cancellationToken)
+    {
+        try
         {
-            await foreach (string path in FileQueue.Reader.ReadAllAsync())
+            await foreach (string path in FileQueue.Reader.ReadAllAsync(cancellationToken))
             {
                 try
                 {
-                    if (!File.Exists(path))
+                    await WaitUntilResumedAsync(cancellationToken);
+
+                    if (!File.Exists(path) ||
+                        !await WaitForFileReady(path, cancellationToken: cancellationToken) ||
+                        File.Exists(path + ".part"))
                         continue;
 
-                    bool isReady = await WaitForFileReady(path);
+                    string category = Ext.FileExt.GetCategory(Path.GetExtension(path));
+                    string destination = GetDestinationFolder(category)
+                        ?? Interop.KnownFolders.GetDownloadsFolderPath();
 
-                    if (!isReady)
-                    {
-                        Console.WriteLine($"File not ready: {path}");
-                        continue;
-                    }
-                    if (File.Exists(path + ".part"))
-                        continue;
-
-                    string extension = Path.GetExtension(path);
-                    string category = Ext.FileExt.GetCategory(extension);
-                    string? destinationFolder = GetDestinationFolder(category);
-
-                    destinationFolder ??= Interop.KnownFolders.GetDownloadsFolderPath();
-
-                    MoveFile(path, destinationFolder, category);
+                    await WaitUntilResumedAsync(cancellationToken);
+                    MoveFile(path, destination, category);
                 }
-                catch (Exception ex)
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                 {
-                    Console.WriteLine($"Processing error: {path} - {ex.Message}");
+                    break;
+                }
+                catch (Exception)
+                {
+                    // A single inaccessible or invalid file must not stop monitoring.
                 }
                 finally
                 {
@@ -210,89 +288,70 @@ namespace DownloadManager.Core
                 }
             }
         }
-        // folder to move file
-        private static string? GetDestinationFolder(string category)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            return category switch
-            {
-                "Video" => Interop.KnownFolders.GetVideosFolderPath(),
-                "Music" => Interop.KnownFolders.GetMusicFolderPath(),
-                "Image" => Interop.KnownFolders.GetPicturesFolderPath(),
-                "Document" => Interop.KnownFolders.GetDocumentsFolderPath(),
-                _ => null
-            };
+            // Normal shutdown.
+        }
+    }
+
+    private static string? GetDestinationFolder(string category) => category switch
+    {
+        "Video" => Interop.KnownFolders.GetVideosFolderPath(),
+        "Music" => Interop.KnownFolders.GetMusicFolderPath(),
+        "Image" => Interop.KnownFolders.GetPicturesFolderPath(),
+        "Document" => Interop.KnownFolders.GetDocumentsFolderPath(),
+        _ => null
+    };
+
+    private static void MoveFile(string sourcePath, string destinationFolder, string category) =>
+        MoveFile(sourcePath, destinationFolder, category,
+            Erename.IsEnabled, Erename.GetFileName);
+
+    internal static void MoveFile(
+        string sourcePath,
+        string destinationFolder,
+        string category,
+        bool renameFile,
+        Func<string, string, string> getFileName)
+    {
+        Directory.CreateDirectory(destinationFolder);
+
+        string fileName = renameFile
+            ? getFileName(sourcePath, destinationFolder)
+            : Path.GetFileName(sourcePath);
+
+        string destinationPath = Path.Combine(destinationFolder, fileName);
+
+        if (string.Equals(
+            Path.GetFullPath(sourcePath),
+            Path.GetFullPath(destinationPath),
+            StringComparison.OrdinalIgnoreCase))
+            return;
+
+        if (!renameFile)
+        {
+            string name = Path.GetFileNameWithoutExtension(fileName);
+            string extension = Path.GetExtension(fileName);
+            int number = 1;
+
+            while (File.Exists(destinationPath))
+                destinationPath = Path.Combine(
+                    destinationFolder, $"{name} ({number++}){extension}");
         }
 
-        // move method
-        private static void MoveFile(
-            string sourcePath,
-            string destinationFolder,
-            string category)
+        bool trackRename = category == "Unknown" && renameFile;
+        if (trackRename)
+            IgnoredPaths.TryAdd(destinationPath, 0);
+
+        try
         {
-            MoveFile(
-                sourcePath,
-                destinationFolder,
-                category,
-                Erename.IsEnabled,
-                Erename.GetFileName);
+            File.Move(sourcePath, destinationPath);
         }
-        
-        internal static void MoveFile(
-            string sourcePath,
-            string destinationFolder,
-            string category,
-            bool renameFile,
-            Func<string, string, string> getFileName)
+        catch
         {
-            Directory.CreateDirectory(destinationFolder);
-        
-            string fileName = renameFile
-                ? getFileName(sourcePath, destinationFolder)
-                : Path.GetFileName(sourcePath);
-
-            string destinationPath = Path.Combine(destinationFolder, fileName);
-
-            if (Path.GetFullPath(sourcePath).Equals(
-                Path.GetFullPath(destinationPath),
-                StringComparison.OrdinalIgnoreCase))
-            {
-                return;
-            }
-
-            if (!renameFile)
-            {
-                int number = 1;
-
-                while (File.Exists(destinationPath))
-                {
-                    string name = Path.GetFileNameWithoutExtension(fileName);
-                    string extension = Path.GetExtension(fileName);
-
-                    destinationPath = Path.Combine(
-                        destinationFolder,
-                        $"{name} ({number}){extension}");
-
-                    number++;
-                }
-            }
-
-            bool isDownloadsFolder = category == "Unknown" && renameFile;
-
-            if (isDownloadsFolder)
-                IgnoredPaths.TryAdd(destinationPath, 0);
-
-            try
-            {
-                File.Move(sourcePath, destinationPath);
-                Console.WriteLine($"Moved: {sourcePath} -> {destinationPath}");
-            }
-            catch
-            {
-                if (isDownloadsFolder)
-                    IgnoredPaths.TryRemove(destinationPath, out _);
-
-                throw;
-            }
+            if (trackRename)
+                IgnoredPaths.TryRemove(destinationPath, out _);
+            throw;
         }
     }
 }

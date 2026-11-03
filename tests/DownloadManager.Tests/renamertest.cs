@@ -111,6 +111,51 @@ public class Erenametests : IDisposable
         Assert.Equal("original.mp4", result);
     }
 
+    [Fact]
+    public void GetFileName_UsesOriginalNameWhenPrefixIsEmpty()
+    {
+        RenameSettings settings = new("", true, false);
+
+        string result = Erename.GetFileName(
+            "video.mp4",
+            _testFolder,
+            _testDate,
+            settings);
+
+        Assert.Equal("video_02.11.2026_1430.mp4", result);
+    }
+
+    [Fact]
+    public void GetFileName_UsesPrefixInsteadOfOriginalName()
+    {
+        RenameSettings settings = new("MyName", false, false);
+
+        string result = Erename.GetFileName(
+            "video.mp4",
+            _testFolder,
+            _testDate,
+            settings);
+
+        Assert.Equal("MyName.mp4", result);
+    }
+
+    [Fact]
+    public void GetFileName_AddsRandomNumberToOriginalName()
+    {
+        RenameSettings settings = new("", false, true);
+
+        string result = Erename.GetFileName(
+            "video.mp4",
+            _testFolder,
+            _testDate,
+            settings);
+
+        Assert.Matches(
+            @"^video_([1-9]|[1-4][0-9]|50)\.mp4$",
+            result);
+    }
+
+
     public void Dispose()
     {
         Directory.Delete(_testFolder, true);
