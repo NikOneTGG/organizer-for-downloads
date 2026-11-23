@@ -30,7 +30,7 @@ dotnet test .\DownloadManager.slnx -c Release
 
 Latest result:
 
-- __35 passed__
+- __50 passed__
 - __0 failed__
 - __0 skipped__
 
