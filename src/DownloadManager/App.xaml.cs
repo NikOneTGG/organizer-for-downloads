@@ -2,9 +2,11 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Interop;
+using System.Windows.Threading;
 using System.Diagnostics;
 using Microsoft.Win32;
 using Application = System.Windows.Application;
+using UserSettings = DownloadManager.Core.UserSettings;
 
 namespace DownloadManager;
 
@@ -24,13 +26,18 @@ public partial class App : Application
     private const uint NIF_TIP = 0x00000004;
 
     private const uint MF_STRING = 0x00000000;
+    private const uint MF_CHECKED = 0x00000008;
+    private const uint MF_POPUP = 0x00000010;
 
     private const uint TPM_RIGHTBUTTON = 0x0002;
     private const uint TPM_RETURNCMD = 0x0100;
 
     private const uint ID_PAUSE = 1;
     private const uint ID_EXIT = 2;
-    private const uint ID_CONFIGURE = 3;
+    private const uint ID_FILENAME = 3;
+    private const uint ID_DATETIME = 4;
+    private const uint ID_RANDOM = 5;
+    private const uint ID_AUTOSTART = 6;
 
     private const int HWND_MESSAGE = -3;
 
@@ -42,12 +49,19 @@ public partial class App : Application
     private const string runRegistryPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
     private const string startupValueName = "OrganizeMyDownloads";
 
+    private const int MaxTrayRetries = 60;
+    private static readonly TimeSpan TrayRetryInterval = TimeSpan.FromSeconds(2);
+
+    private DispatcherTimer? _trayRetryTimer;
+    private int _trayRetryCount;
+
     private HwndSource? _messageSource;
     private IntPtr _iconHandle;
     private bool _isPaused;
     private bool _trayIconAdded;
 
     private bool _isExiting;
+    private bool _nameDialogOpen;
 
     private uint _taskbarCreatedMessage;
 
@@ -114,23 +128,43 @@ protected override void OnStartup(StartupEventArgs e)
 
     }
 
+
     private void configureAutoStart()
     {
         try
         {
-            string? executablePath = Environment.ProcessPath;
-            if (string.IsNullOrWhiteSpace(executablePath))
-                return;
-
-            string command = $"\"{executablePath}\"";
-
-            using RegistryKey? runKey = Registry.CurrentUser.CreateSubKey(runRegistryPath);
+            using RegistryKey? runKey =
+                Registry.CurrentUser.CreateSubKey(runRegistryPath);
+    
             if (runKey == null)
                 return;
-
-            string? currentCommand = runKey.GetValue(startupValueName) as string;
-            if (!string.Equals(currentCommand, command, StringComparison.OrdinalIgnoreCase))
-                runKey.SetValue(startupValueName, command, RegistryValueKind.String);
+    
+            if (!LoadSettings().AutostartEnabled)
+            {
+                runKey.DeleteValue(startupValueName, false);
+                return;
+            }
+    
+            string? executablePath = Environment.ProcessPath;
+    
+            if (string.IsNullOrWhiteSpace(executablePath))
+                return;
+    
+            string command = $"\"{executablePath}\"";
+    
+            string? currentCommand =
+                runKey.GetValue(startupValueName) as string;
+    
+            if (!string.Equals(
+                currentCommand,
+                command,
+                StringComparison.OrdinalIgnoreCase))
+            {
+                runKey.SetValue(
+                    startupValueName,
+                    command,
+                    RegistryValueKind.String);
+            }
         }
         catch (Exception ex)
         {
@@ -170,16 +204,55 @@ protected override void OnStartup(StartupEventArgs e)
 
         _trayIconAdded = Shell_NotifyIcon(NIM_ADD, ref data);
 
-        if (!_trayIconAdded)
+        if (_trayIconAdded)
         {
-            System.Windows.MessageBox.Show(
-                "Failed to add the tray icon.",
-                "OrganizeMyDownloads",
-                MessageBoxButton.OK,
-                MessageBoxImage.Error);
-
-            Shutdown();
+            StopTrayRetry();
+            return;
         }
+
+        StartTrayRetry();
+    }
+
+    private void StartTrayRetry()
+    {
+        if (_trayRetryTimer != null)
+            return;
+
+        _trayRetryTimer = new DispatcherTimer
+        {
+            Interval = TrayRetryInterval
+        };
+
+        _trayRetryTimer.Tick += (_, _) =>
+        {
+            if (++_trayRetryCount > MaxTrayRetries)
+            {
+                StopTrayRetry();
+
+                System.Windows.MessageBox.Show(
+                    "Failed to add the tray icon.",
+                    "OrganizeMyDownloads",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+
+                Shutdown();
+                return;
+            }
+
+            AddTrayIcon();
+        };
+
+        _trayRetryTimer.Start();
+    }
+
+    private void StopTrayRetry()
+    {
+        if (_trayRetryTimer == null)
+            return;
+
+        _trayRetryTimer.Stop();
+        _trayRetryTimer = null;
+        _trayRetryCount = 0;
     }
 
     private IntPtr WindowProcedure(
@@ -232,7 +305,8 @@ protected override void OnStartup(StartupEventArgs e)
         {
           /* change text in "" to set one name for every installed file */"Namefile": "",
           /* change it from false to true to add date and time into file name */"Dateandtime": true,
-          /* change it from false to true to add random number 1-50 into file name */ "Randomnum": true
+          /* change it from false to true to add random number 1-50 into file name */ "Randomnum": true,
+          /* change it from "on" to "off" to stop the app from starting with Windows */ "Autostart": "on"
         }
         """;
 
@@ -246,11 +320,30 @@ protected override void OnStartup(StartupEventArgs e)
         if (menu == IntPtr.Zero)
             return;
 
+        IntPtr configureMenu = CreatePopupMenu();
+
+        if (configureMenu == IntPtr.Zero)
+        {
+            DestroyMenu(menu);
+            return;
+        }
+
+        UserSettings settings = LoadSettings();
         string pauseText = _isPaused ? "Unpause" : "Pause";
 
-        AppendMenu(menu, MF_STRING, ID_CONFIGURE, "Configure");
-        AppendMenu(menu, MF_STRING, ID_PAUSE, pauseText);
-        AppendMenu(menu, MF_STRING, ID_EXIT, "Exit");
+        AddMenuItem(configureMenu, ID_FILENAME, "File name...", false);
+        AddMenuItem(configureMenu, ID_DATETIME, "Add date and time", settings.AddDateAndTime);
+        AddMenuItem(configureMenu, ID_RANDOM, "Add random number", settings.AddRandomNumber);
+        AddMenuItem(configureMenu, ID_AUTOSTART, "Start with Windows", settings.AutostartEnabled);
+
+        AppendMenu(
+            menu,
+            MF_STRING | MF_POPUP,
+            new UIntPtr(unchecked((ulong)configureMenu.ToInt64())),
+            "Configure");
+
+        AddMenuItem(menu, ID_PAUSE, pauseText, false);
+        AddMenuItem(menu, ID_EXIT, "Exit", false);
 
         GetCursorPos(out POINT cursor);
 
@@ -275,8 +368,29 @@ protected override void OnStartup(StartupEventArgs e)
 
         switch (selectedItem)
         {
-            case ID_CONFIGURE:
-                OpenConfig();
+            case ID_FILENAME:
+                _ = Dispatcher.InvokeAsync(() => ShowNameDialog());
+                break;
+
+            case ID_DATETIME:
+                UpdateSettings(current => current with
+                {
+                    AddDateAndTime = !current.AddDateAndTime
+                });
+                break;
+
+            case ID_RANDOM:
+                UpdateSettings(current => current with
+                {
+                    AddRandomNumber = !current.AddRandomNumber
+                });
+                break;
+
+            case ID_AUTOSTART:
+                UpdateSettings(current => current with
+                {
+                    AutostartEnabled = !current.AutostartEnabled
+                });
                 break;
 
             case ID_PAUSE:
@@ -289,29 +403,62 @@ protected override void OnStartup(StartupEventArgs e)
         }
     }
 
-    private void OpenConfig()
+    private static void AddMenuItem(IntPtr menu, uint id, string text, bool isChecked) =>
+        AppendMenu(
+            menu,
+            isChecked ? MF_STRING | MF_CHECKED : MF_STRING,
+            new UIntPtr(id),
+            text);
+
+    private static UserSettings LoadSettings()
     {
-        string configPath = GetConfigPath();
-
-
         try
         {
-            EnsureConfigExists();
+            return UserSettings.Load();
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Failed to load settings: {ex}");
+            return new UserSettings("", true, true, true);
+        }
+    }
 
-            Process.Start(new ProcessStartInfo
-            {
-                FileName = "notepad.exe",
-                ArgumentList = { configPath },
-                UseShellExecute = true
-            });
+    private void UpdateSettings(Func<UserSettings, UserSettings> change)
+    {
+        try
+        {
+            UserSettings.Update(change);
+            configureAutoStart();
         }
         catch (Exception ex)
         {
             System.Windows.MessageBox.Show(
-                $"Failed to open configuration:\n{ex.Message}",
+                $"Failed to save settings:\n{ex.Message}",
                 "OrganizeMyDownloads",
                 MessageBoxButton.OK,
                 MessageBoxImage.Error);
+        }
+    }
+
+    private void ShowNameDialog()
+    {
+        if (_nameDialogOpen)
+            return;
+
+        _nameDialogOpen = true;
+
+        try
+        {
+            var dialog = new InputDialog(
+                "Enter one name for every downloaded file. Leave empty to keep the original names.",
+                LoadSettings().FileName);
+
+            if (dialog.ShowDialog() == true)
+                UpdateSettings(current => current with { FileName = dialog.Value });
+        }
+        finally
+        {
+            _nameDialogOpen = false;
         }
     }
 
@@ -323,6 +470,8 @@ protected override void OnStartup(StartupEventArgs e)
 
     protected override void OnExit(ExitEventArgs e)
     {
+        StopTrayRetry();
+        configureAutoStart();
         RemoveTrayIcon();
 
         if (_messageSource != null)
@@ -442,7 +591,7 @@ protected override void OnStartup(StartupEventArgs e)
     private static extern bool AppendMenu(
         IntPtr hMenu,
         uint uFlags,
-        uint uIDNewItem,
+        UIntPtr uIDNewItem,
         string lpNewItem);
 
     [DllImport("user32.dll")]

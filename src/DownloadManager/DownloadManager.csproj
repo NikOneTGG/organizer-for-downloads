@@ -20,6 +20,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Page Include="InputDialog.xaml" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\DownloadManager.Core\DownloadManager.Core.csproj" />
   </ItemGroup>
 
