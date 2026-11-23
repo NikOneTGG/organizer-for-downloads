@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Threading.Channels;
 
 namespace DownloadManager.Core;
@@ -40,6 +40,10 @@ public class DownloadManager
         signal.SetResult();
         return signal;
     }
+
+    public static bool IsAutoStartEnabled() =>
+        AppSettings.LoadOrCreate(
+            Path.Combine(AppContext.BaseDirectory, "config.json")).AutostartEnabled;
 
     public static void SetPaused(bool paused)
     {
